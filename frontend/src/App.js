@@ -10,7 +10,7 @@ function App() {
     <div style={{ minHeight: '100vh', backgroundColor: '#e2e8f0' }}>
       <div style={{ padding: '40px' }}>
         <h1>My RAG Application</h1>
-        <p>The PDF chatbot is ready in the corner.</p>
+        
       </div>
 
       <div className="chat-container">
