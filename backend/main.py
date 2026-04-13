@@ -1,11 +1,12 @@
 import os
-from collections import defaultdict, deque
+from datetime import datetime, timezone
 
 from fastapi import FastAPI
 from pydantic import BaseModel
 from fastapi.middleware.cors import CORSMiddleware
 from huggingface_hub import InferenceClient
 from dotenv import load_dotenv
+from pymongo import MongoClient
 
 from rag_engine import get_rag_pipeline
 
@@ -15,6 +16,7 @@ from rag_engine import get_rag_pipeline
 load_dotenv()
 
 HF_TOKEN = os.getenv("HF_TOKEN")
+MONGO_URI = os.getenv("MONGO_URI", "mongodb://localhost:27017")
 
 BASE_DIR = os.path.dirname(__file__)
 PDF_PATH = os.path.join(BASE_DIR, "data", "insurance.pdf")
@@ -44,9 +46,18 @@ rag_pipeline = get_rag_pipeline(PDF_PATH)
 llm_client = InferenceClient(token=HF_TOKEN)
 
 # -----------------------------------------------------
-# Conversation Memory (in‑memory, session‑based)
+# MongoDB – Conversation Memory
 # -----------------------------------------------------
-chat_memory = defaultdict(lambda: deque(maxlen=MAX_TURNS))
+mongo_client = MongoClient(MONGO_URI)
+db = mongo_client["rag_chatbot"]
+chat_collection = db["conversations"]
+
+# Create index for fast session queries
+chat_collection.create_index("session_id")
+chat_collection.create_index([("session_id", 1), ("timestamp", 1)])
+
+print(f"✅ Connected to MongoDB at {MONGO_URI}")
+
 
 # -----------------------------------------------------
 # Request Models
@@ -57,21 +68,48 @@ class ChatRequest(BaseModel):
 
 
 # -----------------------------------------------------
+# MongoDB Helpers
+# -----------------------------------------------------
+def get_recent_history(session_id: str, limit: int = MAX_TURNS):
+    """Fetch the last `limit` user-assistant turn pairs from MongoDB."""
+    docs = list(
+        chat_collection.find(
+            {"session_id": session_id},
+            {"_id": 0, "role": 1, "content": 1, "timestamp": 1},
+        )
+        .sort("timestamp", 1)  # oldest first
+    )
+    # Return last `limit * 2` messages (each turn = user + assistant)
+    return docs[-(limit * 2):]
+
+
+def store_message(session_id: str, role: str, content: str):
+    """Insert a single message into MongoDB."""
+    chat_collection.insert_one({
+        "session_id": session_id,
+        "role": role,
+        "content": content,
+        "timestamp": datetime.now(timezone.utc),
+    })
+
+
+# -----------------------------------------------------
 # Helper Functions
 # -----------------------------------------------------
 def rewrite_query_if_needed(session_id: str, query: str) -> str:
     """
-    Rewrite follow‑up questions into standalone questions
-    using recent conversation memory.
+    Rewrite follow-up questions into standalone questions
+    using recent conversation memory from MongoDB.
     """
-    history = chat_memory[session_id]
+    history_docs = get_recent_history(session_id)
 
-    if not history:
+    if not history_docs:
         return query
 
     history_text = ""
-    for turn in history:
-        history_text += f"User: {turn['user']}\nAssistant: {turn['assistant']}\n"
+    for msg in history_docs:
+        label = "User" if msg["role"] == "user" else "Assistant"
+        history_text += f"{label}: {msg['content']}\n"
 
     prompt = (
         "Rewrite the user's question into a standalone question.\n"
@@ -138,7 +176,7 @@ async def chat(req: ChatRequest):
     user_query = req.message.strip()
 
     if not user_query:
-        return {"answer": "Please ask a valid insurance‑related question."}
+        return {"answer": "Please ask a valid insurance-related question."}
 
     try:
         # 1️⃣ Rewrite query if conversational
@@ -153,7 +191,7 @@ async def chat(req: ChatRequest):
         if not context or len(context) < 300:
             return {
                 "answer": (
-                    "I couldn’t find enough information in the document "
+                    "I couldn't find enough information in the document "
                     "to answer this accurately."
                 )
             }
@@ -180,11 +218,9 @@ async def chat(req: ChatRequest):
                 "Actual coverage depends on full policy terms and conditions."
             )
 
-        # 6️⃣ Store conversation memory
-        chat_memory[session_id].append({
-            "user": user_query,
-            "assistant": answer
-        })
+        # 6️⃣ Store conversation in MongoDB
+        store_message(session_id, "user", user_query)
+        store_message(session_id, "assistant", answer)
 
         return {
             "answer": answer,
@@ -199,6 +235,57 @@ async def chat(req: ChatRequest):
                 "Please try again later."
             )
         }
+
+
+# -----------------------------------------------------
+# History Endpoint – Get messages for a session
+# -----------------------------------------------------
+@app.get("/history/{session_id}")
+async def get_history(session_id: str):
+    docs = list(
+        chat_collection.find(
+            {"session_id": session_id},
+            {"_id": 0, "role": 1, "content": 1, "timestamp": 1},
+        )
+        .sort("timestamp", 1)
+    )
+    # Convert datetime to ISO string for JSON serialization
+    for doc in docs:
+        if "timestamp" in doc:
+            doc["timestamp"] = doc["timestamp"].isoformat()
+    return {"session_id": session_id, "messages": docs}
+
+
+# -----------------------------------------------------
+# Sessions Endpoint – List all past sessions
+# -----------------------------------------------------
+@app.get("/sessions")
+async def list_sessions():
+    pipeline = [
+        {"$sort": {"timestamp": -1}},
+        {
+            "$group": {
+                "_id": "$session_id",
+                "last_message": {"$first": "$content"},
+                "last_timestamp": {"$first": "$timestamp"},
+                "message_count": {"$sum": 1},
+            }
+        },
+        {"$sort": {"last_timestamp": -1}},
+        {"$limit": 20},
+    ]
+    results = list(chat_collection.aggregate(pipeline))
+
+    sessions = []
+    for r in results:
+        sessions.append({
+            "session_id": r["_id"],
+            "preview": (r["last_message"] or "")[:80],
+            "last_timestamp": r["last_timestamp"].isoformat() if r.get("last_timestamp") else None,
+            "message_count": r["message_count"],
+        })
+
+    return {"sessions": sessions}
 
 
 # -----------------------------------------------------
